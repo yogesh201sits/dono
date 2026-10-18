@@ -1,18 +1,10 @@
 import { Scheduler } from "./scheduler/scheduler.js";
 
 export interface DonoOptions {
-  /**
-   * Maximum number of tasks executing simultaneously.
-   * Defaults to Infinity (unlimited concurrency).
-   */
   readonly concurrency?: number;
 }
 
 export interface DonoAddOptions {
-  /**
-   * Higher numeric priorities execute first.
-   * Defaults to 0.
-   */
   readonly priority?: number;
 }
 
@@ -39,6 +31,14 @@ export class Dono {
     return this.#scheduler.size;
   }
 
+  get isPaused(): boolean {
+    return this.#scheduler.isPaused;
+  }
+
+  get isClosed(): boolean {
+    return this.#scheduler.isClosed;
+  }
+
   add<T>(
     task: DonoTask<T>,
     options: DonoAddOptions = {},
@@ -53,6 +53,22 @@ export class Dono {
         options,
       );
     });
+  }
+
+  pause(): void {
+    this.#scheduler.pause();
+  }
+
+  start(): void {
+    this.#scheduler.start();
+  }
+
+  clear(): void {
+    this.#scheduler.clear();
+  }
+
+  close(): Promise<void> {
+    return this.#scheduler.close();
   }
 
   onEmpty(): Promise<void> {

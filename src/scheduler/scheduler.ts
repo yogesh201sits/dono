@@ -1,5 +1,7 @@
-import { PriorityQueue } from "../queue/priority-queue.js";
-import type { QueuedTask } from "../task/task.js";
+
+import { PriorityQueue } from "../queue/priority-queue";
+import { DonoClearedError, DonoClosedError } from "../errors/duno-errors";
+import type { QueuedTask } from "../task/task";
 
 export interface SchedulerOptions {
   readonly concurrency: number;
@@ -28,6 +30,9 @@ export class Scheduler {
 
   #running = 0;
   #nextSequence = 0;
+  #paused = false;
+  #closed = false;
+  #closePromise: Promise<void> | undefined;
 
   readonly #emptyWaiters: Array<() => void> = [];
   readonly #idleWaiters: Array<() => void> = [];
@@ -59,7 +64,19 @@ export class Scheduler {
     return this.#queue.size;
   }
 
+  get isPaused(): boolean {
+    return this.#paused;
+  }
+
+  get isClosed(): boolean {
+    return this.#closed;
+  }
+
   add(task: QueuedTask, options: ScheduleOptions = {}): void {
+    if (this.#closed) {
+      throw new DonoClosedError();
+    }
+
     const priority = options.priority ?? 0;
 
     if (!Number.isFinite(priority)) {
@@ -73,6 +90,51 @@ export class Scheduler {
     });
 
     this.#drain();
+  }
+
+  pause(): void {
+  if (this.#closed) {
+    return;
+  }
+
+  this.#paused = true;
+}
+
+  start(): void {
+    if (this.#closed && this.#queue.isEmpty) {
+      return;
+    }
+
+    this.#paused = false;
+    this.#drain();
+  }
+
+  clear(): void {
+    while (!this.#queue.isEmpty) {
+      const entry = this.#queue.pop();
+
+      entry?.task.reject(new DonoClearedError());
+    }
+
+    this.#notifyEmpty();
+    this.#notifyIdle();
+  }
+
+  close(): Promise<void> {
+    if (this.#closePromise !== undefined) {
+      return this.#closePromise;
+    }
+
+    this.#closed = true;
+
+    // Graceful close must not hang indefinitely because the queue
+    // was paused. Running work continues and pending work is drained.
+    this.#paused = false;
+    this.#drain();
+
+    this.#closePromise = this.onIdle();
+
+    return this.#closePromise;
   }
 
   onEmpty(): Promise<void> {
@@ -97,6 +159,7 @@ export class Scheduler {
 
   #drain(): void {
     while (
+      !this.#paused &&
       this.#running < this.#concurrency &&
       !this.#queue.isEmpty
     ) {
