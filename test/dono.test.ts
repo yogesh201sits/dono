@@ -176,4 +176,127 @@ describe("Dono", () => {
     expect(results).toEqual([1, 2, 3]);
     await queue.onIdle();
   });
+
+  test("executes higher-priority tasks first", async () => {
+    const queue = new Dono({ concurrency: 1 });
+    const executionOrder: string[] = [];
+    const gate = deferred<void>();
+
+    const blocker = queue.add(async () => {
+      await gate.promise;
+      executionOrder.push("blocker");
+    });
+
+    // Ensure the first task occupies the only slot.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const low = queue.add(
+      () => {
+        executionOrder.push("low");
+        return "low";
+      },
+      { priority: 1 },
+    );
+
+    const high = queue.add(
+      () => {
+        executionOrder.push("high");
+        return "high";
+      },
+      { priority: 10 },
+    );
+
+    const normal = queue.add(
+      () => {
+        executionOrder.push("normal");
+        return "normal";
+      },
+      { priority: 5 },
+    );
+
+    gate.resolve();
+
+    await Promise.all([blocker, low, high, normal]);
+    await queue.onIdle();
+
+    expect(executionOrder).toEqual([
+      "blocker",
+      "high",
+      "normal",
+      "low",
+    ]);
+  });
+
+  test("preserves FIFO order for equal priorities", async () => {
+    const queue = new Dono({ concurrency: 1 });
+    const executionOrder: number[] = [];
+    const gate = deferred<void>();
+
+    const blocker = queue.add(async () => {
+      await gate.promise;
+    });
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const tasks = [1, 2, 3, 4].map((value) =>
+      queue.add(
+        () => {
+          executionOrder.push(value);
+        },
+        { priority: 5 },
+      ),
+    );
+
+    gate.resolve();
+
+    await Promise.all([blocker, ...tasks]);
+    await queue.onIdle();
+
+    expect(executionOrder).toEqual([1, 2, 3, 4]);
+  });
+
+  test("defaults task priority to zero", async () => {
+    const queue = new Dono({ concurrency: 1 });
+    const executionOrder: string[] = [];
+    const gate = deferred<void>();
+
+    const blocker = queue.add(async () => {
+      await gate.promise;
+    });
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const defaultPriority = queue.add(() => {
+      executionOrder.push("default");
+    });
+
+    const higherPriority = queue.add(
+      () => {
+        executionOrder.push("higher");
+      },
+      { priority: 1 },
+    );
+
+    gate.resolve();
+
+    await Promise.all([blocker, defaultPriority, higherPriority]);
+    await queue.onIdle();
+
+    expect(executionOrder).toEqual(["higher", "default"]);
+  });
+
+  test("rejects non-finite priorities", async () => {
+    const queue = new Dono({ concurrency: 1 });
+
+    for (const priority of [NaN, Infinity, -Infinity]) {
+      await expect(
+        queue.add(() => "invalid", { priority }),
+      ).rejects.toThrow(RangeError);
+    }
+
+    await queue.onIdle();
+  });
 });

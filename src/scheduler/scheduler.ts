@@ -1,37 +1,54 @@
+import { PriorityQueue } from "../queue/priority-queue.js";
 import type { QueuedTask } from "../task/task.js";
 
 export interface SchedulerOptions {
   readonly concurrency: number;
 }
 
+export interface ScheduleOptions {
+  readonly priority?: number;
+}
+
+interface QueueEntry {
+  readonly task: QueuedTask;
+  readonly priority: number;
+  readonly sequence: number;
+}
+
 export class Scheduler {
   readonly #concurrency: number;
-  readonly #queue: QueuedTask[] = [];
+
+  readonly #queue = new PriorityQueue<QueueEntry>((a, b) => {
+    if (a.priority !== b.priority) {
+      return b.priority - a.priority;
+    }
+
+    return a.sequence - b.sequence;
+  });
 
   #running = 0;
+  #nextSequence = 0;
 
   readonly #emptyWaiters: Array<() => void> = [];
   readonly #idleWaiters: Array<() => void> = [];
 
-  
-    constructor(options: SchedulerOptions) {
-        const { concurrency } = options;
+  constructor(options: SchedulerOptions) {
+    const { concurrency } = options;
 
-        if (
-            concurrency !== Infinity &&
-            (!Number.isInteger(concurrency) || concurrency < 1)
-        ) {
-            throw new RangeError(
-            "concurrency must be a positive integer or Infinity",
-            );
-        }
-
-        this.#concurrency = concurrency;
+    if (
+      concurrency !== Infinity &&
+      (!Number.isInteger(concurrency) || concurrency < 1)
+    ) {
+      throw new RangeError(
+        "concurrency must be a positive integer or Infinity",
+      );
     }
 
+    this.#concurrency = concurrency;
+  }
 
   get pending(): number {
-    return this.#queue.length;
+    return this.#queue.size;
   }
 
   get running(): number {
@@ -39,16 +56,27 @@ export class Scheduler {
   }
 
   get size(): number {
-    return this.#queue.length;
+    return this.#queue.size;
   }
 
-  add(task: QueuedTask): void {
-    this.#queue.push(task);
+  add(task: QueuedTask, options: ScheduleOptions = {}): void {
+    const priority = options.priority ?? 0;
+
+    if (!Number.isFinite(priority)) {
+      throw new RangeError("priority must be a finite number");
+    }
+
+    this.#queue.push({
+      task,
+      priority,
+      sequence: this.#nextSequence++,
+    });
+
     this.#drain();
   }
 
   onEmpty(): Promise<void> {
-    if (this.#queue.length === 0) {
+    if (this.#queue.isEmpty) {
       return Promise.resolve();
     }
 
@@ -58,7 +86,7 @@ export class Scheduler {
   }
 
   onIdle(): Promise<void> {
-    if (this.#queue.length === 0 && this.#running === 0) {
+    if (this.#queue.isEmpty && this.#running === 0) {
       return Promise.resolve();
     }
 
@@ -70,17 +98,16 @@ export class Scheduler {
   #drain(): void {
     while (
       this.#running < this.#concurrency &&
-      this.#queue.length > 0
+      !this.#queue.isEmpty
     ) {
-      const task = this.#queue.shift();
+      const entry = this.#queue.pop();
 
-      if (task === undefined) {
+      if (entry === undefined) {
         break;
       }
 
-      // Reserve the slot before invoking user code.
       this.#running += 1;
-      this.#run(task);
+      this.#run(entry.task);
     }
 
     this.#notifyEmpty();
@@ -103,8 +130,6 @@ export class Scheduler {
           this.#finish();
         },
         () => {
-          // Promise settlement callbacks should not throw.
-          // Still release the slot if an unexpected error occurs.
           this.#finish();
         },
       );
@@ -116,7 +141,7 @@ export class Scheduler {
   }
 
   #notifyEmpty(): void {
-    if (this.#queue.length !== 0) {
+    if (!this.#queue.isEmpty) {
       return;
     }
 
@@ -128,7 +153,7 @@ export class Scheduler {
   }
 
   #notifyIdle(): void {
-    if (this.#queue.length !== 0 || this.#running !== 0) {
+    if (!this.#queue.isEmpty || this.#running !== 0) {
       return;
     }
 
