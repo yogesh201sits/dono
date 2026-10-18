@@ -5,3 +5,8 @@ export type {
   DonoOptions,
   DonoTask,
 } from "./dono.js";
+
+export {
+  DonoClearedError,
+  DonoClosedError,
+} from "./errors/duno-errors";
