@@ -39,6 +39,28 @@ export class PriorityQueue<T> {
     return root;
   }
 
+  remove(predicate: (item: T) => boolean): T[] {
+    const removed: T[] = [];
+    const retained: T[] = [];
+
+    for (const item of this.#items) {
+      if (predicate(item)) {
+        removed.push(item);
+      } else {
+        retained.push(item);
+      }
+    }
+
+    this.#items.length = 0;
+    this.#items.push(...retained);
+
+    for (let i = Math.floor(this.#items.length / 2) - 1; i >= 0; i--) {
+      this.#siftDown(i);
+    }
+
+    return removed;
+  }
+
   #siftUp(startIndex: number): void {
     let index = startIndex;
 

@@ -7,6 +7,8 @@ export type {
 } from "./dono.js";
 
 export {
+  DonoCancelledError,
   DonoClearedError,
   DonoClosedError,
-} from "./errors/duno-errors";
+  DonoTimeoutError,
+} from "./errors/dono-errors.js";
