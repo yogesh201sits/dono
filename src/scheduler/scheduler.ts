@@ -9,6 +9,8 @@ import type { QueuedTask } from "../task/task.js";
 
 export interface SchedulerOptions {
   readonly concurrency: number;
+  readonly intervalCap?: number;
+  readonly interval?: number;
 }
 
 export interface ScheduleOptions {
@@ -38,6 +40,8 @@ type Outcome =
 
 export class Scheduler {
   readonly #concurrency: number;
+  readonly #intervalCap: number | undefined;
+  readonly #interval: number | undefined;
 
   readonly #queue = new PriorityQueue<QueueEntry>((a, b) => {
     if (a.priority !== b.priority) {
@@ -53,11 +57,15 @@ export class Scheduler {
   #closed = false;
   #closePromise: Promise<void> | undefined;
 
+  #windowStartedAt = Date.now();
+  #startsInWindow = 0;
+  #rateLimitTimer: ReturnType<typeof setTimeout> | undefined;
+
   readonly #emptyWaiters: Array<() => void> = [];
   readonly #idleWaiters: Array<() => void> = [];
 
   constructor(options: SchedulerOptions) {
-    const { concurrency } = options;
+    const { concurrency, intervalCap, interval } = options;
 
     if (
       concurrency !== Infinity &&
@@ -68,7 +76,35 @@ export class Scheduler {
       );
     }
 
+    if ((intervalCap === undefined) !== (interval === undefined)) {
+      throw new TypeError(
+        "intervalCap and interval must be provided together",
+      );
+    }
+
+    if (
+      intervalCap !== undefined &&
+      (!Number.isSafeInteger(intervalCap) || intervalCap < 1)
+    ) {
+      throw new RangeError(
+        "intervalCap must be a positive safe integer",
+      );
+    }
+
+    if (
+      interval !== undefined &&
+      (!Number.isFinite(interval) ||
+        interval < 1 ||
+        interval > 2_147_483_647)
+    ) {
+      throw new RangeError(
+        "interval must be between 1 and 2147483647 milliseconds",
+      );
+    }
+
     this.#concurrency = concurrency;
+    this.#intervalCap = intervalCap;
+    this.#interval = interval;
   }
 
   get pending(): number {
@@ -107,7 +143,9 @@ export class Scheduler {
       timeout !== undefined &&
       (!Number.isFinite(timeout) || timeout < 0)
     ) {
-      throw new RangeError("timeout must be a finite non-negative number");
+      throw new RangeError(
+        "timeout must be a finite non-negative number",
+      );
     }
 
     if (signal?.aborted) {
@@ -117,35 +155,34 @@ export class Scheduler {
 
     const controller = new AbortController();
 
-    const entry: QueueEntry = {
+    let entry!: QueueEntry;
+
+    const abortListener =
+      signal === undefined
+        ? undefined
+        : () => {
+            const error = new DonoCancelledError();
+
+            controller.abort(error);
+            this.#cancelEntry(entry, error);
+          };
+
+    entry = {
       task,
       priority,
       sequence: this.#nextSequence++,
       controller,
       externalSignal: signal,
-      abortListener: undefined,
+      abortListener,
       timeout,
       state: "pending",
       timeoutHandle: undefined,
     };
 
-    if (signal !== undefined) {
-      const listener = () => {
-        const error = new DonoCancelledError();
-
-        controller.abort(error);
-        this.#cancelEntry(entry, error);
-      };
-
-      // The listener is immutable on the entry after construction.
-      // See the adjusted QueueEntry definition below if your TS config
-      // rejects assigning this field after creation.
-      Object.defineProperty(entry, "abortListener", {
-        value: listener,
-        enumerable: true,
+    if (signal !== undefined && abortListener !== undefined) {
+      signal.addEventListener("abort", abortListener, {
+        once: true,
       });
-
-      signal.addEventListener("abort", listener, { once: true });
     }
 
     this.#queue.push(entry);
@@ -214,12 +251,65 @@ export class Scheduler {
     });
   }
 
+  #canStartTask(): boolean {
+    if (
+      this.#intervalCap === undefined ||
+      this.#interval === undefined
+    ) {
+      return true;
+    }
+
+    const now = Date.now();
+    const elapsed = now - this.#windowStartedAt;
+
+    if (elapsed >= this.#interval) {
+      this.#clearRateLimitTimer();
+      this.#windowStartedAt = now;
+      this.#startsInWindow = 0;
+    }
+
+    if (this.#startsInWindow >= this.#intervalCap) {
+      this.#scheduleRateLimitCheck();
+      return false;
+    }
+
+    this.#startsInWindow += 1;
+    return true;
+  }
+
+  #scheduleRateLimitCheck(): void {
+    if (
+      this.#rateLimitTimer !== undefined ||
+      this.#interval === undefined
+    ) {
+      return;
+    }
+
+    const elapsed = Date.now() - this.#windowStartedAt;
+    const delay = Math.max(1, this.#interval - elapsed);
+
+    this.#rateLimitTimer = setTimeout(() => {
+      this.#rateLimitTimer = undefined;
+      this.#drain();
+    }, delay);
+  }
+
+  #clearRateLimitTimer(): void {
+    if (this.#rateLimitTimer === undefined) return;
+
+    clearTimeout(this.#rateLimitTimer);
+    this.#rateLimitTimer = undefined;
+  }
+
   #drain(): void {
     while (
       !this.#paused &&
       this.#running < this.#concurrency &&
       !this.#queue.isEmpty
     ) {
+      // Check the rate limit before removing a pending task.
+      if (!this.#canStartTask()) break;
+
       const entry = this.#queue.pop();
       if (entry === undefined) break;
       if (entry.state !== "pending") continue;
@@ -229,6 +319,10 @@ export class Scheduler {
       this.#run(entry);
     }
 
+    if (this.#queue.isEmpty) {
+      this.#clearRateLimitTimer();
+    }
+
     this.#notifyEmpty();
     this.#notifyIdle();
   }
@@ -236,21 +330,26 @@ export class Scheduler {
   #run(entry: QueueEntry): void {
     if (entry.timeout !== undefined) {
       entry.timeoutHandle = setTimeout(() => {
+        if (entry.state !== "running") return;
+
         const error = new DonoTimeoutError(entry.timeout!);
 
         entry.controller.abort(error);
         this.#settle(entry, { ok: false, error });
       }, entry.timeout);
     }
+
     Promise.resolve()
-    .then(() => {
-      if (entry.state !== "running") return undefined;
-      return entry.task.run(entry.controller.signal);
-    })
-    .then(
-      (value) => this.#settle(entry, { ok: true, value }),
-      (error: unknown) => this.#settle(entry, { ok: false, error }),
-    );
+      .then(() => {
+        if (entry.state !== "running") return undefined;
+
+        return entry.task.run(entry.controller.signal);
+      })
+      .then(
+        (value) => this.#settle(entry, { ok: true, value }),
+        (error: unknown) =>
+          this.#settle(entry, { ok: false, error }),
+      );
   }
 
   #cancelEntry(entry: QueueEntry, error: unknown): void {
