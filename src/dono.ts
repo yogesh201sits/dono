@@ -1,4 +1,8 @@
-import { Scheduler } from "./scheduler/scheduler.js";
+
+import {
+  Scheduler,
+  validateRetryOptions,
+} from "./scheduler/scheduler.js";
 
 export interface DonoOptions {
   readonly concurrency?: number;
@@ -10,6 +14,12 @@ export interface DonoAddOptions {
   readonly priority?: number;
   readonly signal?: AbortSignal;
   readonly timeout?: number;
+  /** Maximum number of additional attempts after the first failure. */
+  readonly retries?: number;
+  /** Initial delay between failed attempts, in milliseconds. */
+  readonly retryDelay?: number;
+  /** Double the delay after each failed attempt. */
+  readonly backoff?: boolean;
 }
 
 export type DonoTask<T> = (
@@ -55,6 +65,8 @@ export class Dono {
     task: DonoTask<T>,
     options: DonoAddOptions = {},
   ): Promise<T> {
+    validateRetryOptions(options);
+
     return new Promise<T>((resolve, reject) => {
       this.#scheduler.add(
         {
