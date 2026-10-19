@@ -2,6 +2,8 @@ import { Scheduler } from "./scheduler/scheduler.js";
 
 export interface DonoOptions {
   readonly concurrency?: number;
+  readonly intervalCap?: number;
+  readonly interval?: number;
 }
 
 export interface DonoAddOptions {
@@ -20,6 +22,12 @@ export class Dono {
   constructor(options: DonoOptions = {}) {
     this.#scheduler = new Scheduler({
       concurrency: options.concurrency ?? Infinity,
+      ...(options.intervalCap !== undefined
+        ? { intervalCap: options.intervalCap }
+        : {}),
+      ...(options.interval !== undefined
+        ? { interval: options.interval }
+        : {}),
     });
   }
 
