@@ -6,9 +6,13 @@ export interface DonoOptions {
 
 export interface DonoAddOptions {
   readonly priority?: number;
+  readonly signal?: AbortSignal;
+  readonly timeout?: number;
 }
 
-export type DonoTask<T> = () => T | PromiseLike<T>;
+export type DonoTask<T> = (
+  signal: AbortSignal,
+) => T | PromiseLike<T>;
 
 export class Dono {
   readonly #scheduler: Scheduler;
@@ -46,7 +50,7 @@ export class Dono {
     return new Promise<T>((resolve, reject) => {
       this.#scheduler.add(
         {
-          run: task,
+          run: (signal) => task(signal),
           resolve: (value) => resolve(value as T),
           reject,
         },

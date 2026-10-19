@@ -1,7 +1,11 @@
-
-import { PriorityQueue } from "../queue/priority-queue";
-import { DonoClearedError, DonoClosedError } from "../errors/duno-errors";
-import type { QueuedTask } from "../task/task";
+import { PriorityQueue } from "../queue/priority-queue.js";
+import {
+  DonoCancelledError,
+  DonoClearedError,
+  DonoClosedError,
+  DonoTimeoutError,
+} from "../errors/dono-errors.js";
+import type { QueuedTask } from "../task/task.js";
 
 export interface SchedulerOptions {
   readonly concurrency: number;
@@ -9,13 +13,28 @@ export interface SchedulerOptions {
 
 export interface ScheduleOptions {
   readonly priority?: number;
+  readonly signal?: AbortSignal;
+  readonly timeout?: number;
 }
+
+type EntryState = "pending" | "running" | "settled";
 
 interface QueueEntry {
   readonly task: QueuedTask;
   readonly priority: number;
   readonly sequence: number;
+  readonly controller: AbortController;
+  readonly externalSignal: AbortSignal | undefined;
+  readonly abortListener: (() => void) | undefined;
+  readonly timeout: number | undefined;
+
+  state: EntryState;
+  timeoutHandle: ReturnType<typeof setTimeout> | undefined;
 }
+
+type Outcome =
+  | { readonly ok: true; readonly value: unknown }
+  | { readonly ok: false; readonly error: unknown };
 
 export class Scheduler {
   readonly #concurrency: number;
@@ -78,42 +97,86 @@ export class Scheduler {
     }
 
     const priority = options.priority ?? 0;
+    const { signal, timeout } = options;
 
     if (!Number.isFinite(priority)) {
       throw new RangeError("priority must be a finite number");
     }
 
-    this.#queue.push({
+    if (
+      timeout !== undefined &&
+      (!Number.isFinite(timeout) || timeout < 0)
+    ) {
+      throw new RangeError("timeout must be a finite non-negative number");
+    }
+
+    if (signal?.aborted) {
+      task.reject(new DonoCancelledError());
+      return;
+    }
+
+    const controller = new AbortController();
+
+    const entry: QueueEntry = {
       task,
       priority,
       sequence: this.#nextSequence++,
-    });
+      controller,
+      externalSignal: signal,
+      abortListener: undefined,
+      timeout,
+      state: "pending",
+      timeoutHandle: undefined,
+    };
 
+    if (signal !== undefined) {
+      const listener = () => {
+        const error = new DonoCancelledError();
+
+        controller.abort(error);
+        this.#cancelEntry(entry, error);
+      };
+
+      // The listener is immutable on the entry after construction.
+      // See the adjusted QueueEntry definition below if your TS config
+      // rejects assigning this field after creation.
+      Object.defineProperty(entry, "abortListener", {
+        value: listener,
+        enumerable: true,
+      });
+
+      signal.addEventListener("abort", listener, { once: true });
+    }
+
+    this.#queue.push(entry);
     this.#drain();
   }
 
   pause(): void {
-  if (this.#closed) {
-    return;
+    if (this.#closed) return;
+    this.#paused = true;
   }
 
-  this.#paused = true;
-}
-
   start(): void {
-    if (this.#closed && this.#queue.isEmpty) {
-      return;
-    }
+    if (this.#closed && this.#queue.isEmpty) return;
 
     this.#paused = false;
     this.#drain();
   }
 
   clear(): void {
+    const removed: QueueEntry[] = [];
+
     while (!this.#queue.isEmpty) {
       const entry = this.#queue.pop();
+      if (entry !== undefined) removed.push(entry);
+    }
 
-      entry?.task.reject(new DonoClearedError());
+    for (const entry of removed) {
+      this.#settle(entry, {
+        ok: false,
+        error: new DonoClearedError(),
+      });
     }
 
     this.#notifyEmpty();
@@ -126,21 +189,15 @@ export class Scheduler {
     }
 
     this.#closed = true;
-
-    // Graceful close must not hang indefinitely because the queue
-    // was paused. Running work continues and pending work is drained.
     this.#paused = false;
     this.#drain();
 
     this.#closePromise = this.onIdle();
-
     return this.#closePromise;
   }
 
   onEmpty(): Promise<void> {
-    if (this.#queue.isEmpty) {
-      return Promise.resolve();
-    }
+    if (this.#queue.isEmpty) return Promise.resolve();
 
     return new Promise<void>((resolve) => {
       this.#emptyWaiters.push(resolve);
@@ -164,66 +221,93 @@ export class Scheduler {
       !this.#queue.isEmpty
     ) {
       const entry = this.#queue.pop();
+      if (entry === undefined) break;
+      if (entry.state !== "pending") continue;
 
-      if (entry === undefined) {
-        break;
-      }
-
+      entry.state = "running";
       this.#running += 1;
-      this.#run(entry.task);
+      this.#run(entry);
     }
 
     this.#notifyEmpty();
     this.#notifyIdle();
   }
 
-  #run(task: QueuedTask): void {
+  #run(entry: QueueEntry): void {
+    if (entry.timeout !== undefined) {
+      entry.timeoutHandle = setTimeout(() => {
+        const error = new DonoTimeoutError(entry.timeout!);
+
+        entry.controller.abort(error);
+        this.#settle(entry, { ok: false, error });
+      }, entry.timeout);
+    }
     Promise.resolve()
-      .then(() => task.run())
-      .then(
-        (result) => {
-          task.resolve(result);
-        },
-        (error: unknown) => {
-          task.reject(error);
-        },
-      )
-      .then(
-        () => {
-          this.#finish();
-        },
-        () => {
-          this.#finish();
-        },
-      );
+    .then(() => {
+      if (entry.state !== "running") return undefined;
+      return entry.task.run(entry.controller.signal);
+    })
+    .then(
+      (value) => this.#settle(entry, { ok: true, value }),
+      (error: unknown) => this.#settle(entry, { ok: false, error }),
+    );
   }
 
-  #finish(): void {
-    this.#running -= 1;
+  #cancelEntry(entry: QueueEntry, error: unknown): void {
+    if (entry.state === "settled") return;
+
+    if (entry.state === "pending") {
+      this.#queue.remove((candidate) => candidate === entry);
+    }
+
+    this.#settle(entry, { ok: false, error });
+  }
+
+  #settle(entry: QueueEntry, outcome: Outcome): void {
+    if (entry.state === "settled") return;
+
+    const wasRunning = entry.state === "running";
+    entry.state = "settled";
+
+    if (entry.timeoutHandle !== undefined) {
+      clearTimeout(entry.timeoutHandle);
+      entry.timeoutHandle = undefined;
+    }
+
+    if (
+      entry.externalSignal !== undefined &&
+      entry.abortListener !== undefined
+    ) {
+      entry.externalSignal.removeEventListener(
+        "abort",
+        entry.abortListener,
+      );
+    }
+
+    if (outcome.ok) {
+      entry.task.resolve(outcome.value);
+    } else {
+      entry.task.reject(outcome.error);
+    }
+
+    if (wasRunning) {
+      this.#running -= 1;
+    }
+
     this.#drain();
   }
 
   #notifyEmpty(): void {
-    if (!this.#queue.isEmpty) {
-      return;
-    }
+    if (!this.#queue.isEmpty) return;
 
     const waiters = this.#emptyWaiters.splice(0);
-
-    for (const resolve of waiters) {
-      resolve();
-    }
+    for (const resolve of waiters) resolve();
   }
 
   #notifyIdle(): void {
-    if (!this.#queue.isEmpty || this.#running !== 0) {
-      return;
-    }
+    if (!this.#queue.isEmpty || this.#running !== 0) return;
 
     const waiters = this.#idleWaiters.splice(0);
-
-    for (const resolve of waiters) {
-      resolve();
-    }
+    for (const resolve of waiters) resolve();
   }
 }
