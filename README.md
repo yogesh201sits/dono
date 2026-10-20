@@ -1,4 +1,19 @@
-# Dono
+
+<div align="center">
+  <img
+    src="https://github.com/user-attachments/assets/409ec42b-f2fe-43f5-b042-792f481305f2"
+    alt="Dono — TypeScript async task scheduler"
+    width="100%"
+  />
+  <p>
+    <img src="https://img.shields.io/badge/TypeScript-3178C6?style=flat-square&logo=typescript&logoColor=white" alt="TypeScript" />
+    <img src="https://img.shields.io/badge/Bun-000000?style=flat-square&logo=bun&logoColor=white" alt="Bun" />
+  </p>
+
+
+  <p>A lightweight, priority-aware async task scheduler for TypeScript.</p>
+</div>
+
 
 **A lightweight, priority-aware asynchronous task scheduler built with TypeScript and Bun.**
 
@@ -303,7 +318,3 @@ Dono/
 ## Project status
 
 Dono is an actively developed project. See the test suite and API documentation for the currently implemented behavior.
-
-## License
-
-See [LICENSE](LICENSE) for license information.
