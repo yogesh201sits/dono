@@ -3,6 +3,7 @@ import {
   DonoCancelledError,
   DonoClearedError,
   DonoClosedError,
+  DonoQueueFullError,
   DonoTimeoutError,
 } from "../errors/dono-errors.js";
 import type { QueuedTask } from "../task/task.js";
@@ -11,6 +12,7 @@ export interface SchedulerOptions {
   readonly concurrency: number;
   readonly intervalCap?: number;
   readonly interval?: number;
+  readonly maxQueueSize?: number;
 }
 
 export interface ScheduleOptions {
@@ -103,6 +105,7 @@ export class Scheduler {
   readonly #concurrency: number;
   readonly #intervalCap: number | undefined;
   readonly #interval: number | undefined;
+  readonly #maxQueueSize: number | undefined;
 
   readonly #queue = new PriorityQueue<QueueEntry>((a, b) => {
     if (a.priority !== b.priority) {
@@ -127,7 +130,12 @@ export class Scheduler {
   readonly #delayedEntries = new Set<QueueEntry>();
 
   constructor(options: SchedulerOptions) {
-    const { concurrency, intervalCap, interval } = options;
+    const {
+      concurrency,
+      intervalCap,
+      interval,
+      maxQueueSize,
+    } = options;
 
     if (
       concurrency !== Infinity &&
@@ -164,9 +172,19 @@ export class Scheduler {
       );
     }
 
+    if (
+      maxQueueSize !== undefined &&
+      (!Number.isSafeInteger(maxQueueSize) || maxQueueSize < 0)
+    ) {
+      throw new RangeError(
+        "maxQueueSize must be a non-negative safe integer",
+      );
+    }
+
     this.#concurrency = concurrency;
     this.#intervalCap = intervalCap;
     this.#interval = interval;
+    this.#maxQueueSize = maxQueueSize;
   }
 
   get pending(): number {
@@ -207,6 +225,15 @@ export class Scheduler {
 
     if (signal?.aborted) {
       task.reject(new DonoCancelledError());
+      return;
+    }
+
+    if (
+      this.#maxQueueSize !== undefined &&
+      this.pending >= this.#maxQueueSize &&
+      !this.#canStartImmediately()
+    ) {
+      task.reject(new DonoQueueFullError(this.#maxQueueSize));
       return;
     }
 
@@ -343,6 +370,28 @@ export class Scheduler {
 
     this.#startsInWindow += 1;
     return true;
+  }
+
+  #canStartImmediately(): boolean {
+    if (
+      this.#paused ||
+      this.#running >= this.#concurrency ||
+      !this.#queue.isEmpty
+    ) {
+      return false;
+    }
+
+    if (
+      this.#intervalCap === undefined ||
+      this.#interval === undefined
+    ) {
+      return true;
+    }
+
+    return (
+      Date.now() - this.#windowStartedAt >= this.#interval ||
+      this.#startsInWindow < this.#intervalCap
+    );
   }
 
   #scheduleRateLimitCheck(): void {
