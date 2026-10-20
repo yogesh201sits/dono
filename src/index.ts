@@ -11,4 +11,5 @@ export {
   DonoClearedError,
   DonoClosedError,
   DonoTimeoutError,
+  DonoQueueFullError
 } from "./errors/dono-errors.js";

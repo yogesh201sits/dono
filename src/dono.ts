@@ -8,6 +8,7 @@ export interface DonoOptions {
   readonly concurrency?: number;
   readonly intervalCap?: number;
   readonly interval?: number;
+  readonly maxQueueSize?: number;
 }
 
 export interface DonoAddOptions {
@@ -37,6 +38,9 @@ export class Dono {
         : {}),
       ...(options.interval !== undefined
         ? { interval: options.interval }
+        : {}),
+      ...(options.maxQueueSize !== undefined
+        ? { maxQueueSize: options.maxQueueSize }
         : {}),
     });
   }

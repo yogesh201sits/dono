@@ -24,3 +24,10 @@ export class DonoTimeoutError extends Error {
     this.name = "DonoTimeoutError";
   }
 }
+
+export class DonoQueueFullError extends Error {
+  constructor(maxQueueSize: number) {
+    super(`Queue is full: maximum pending tasks is ${maxQueueSize}`);
+    this.name = "DonoQueueFullError";
+  }
+}
