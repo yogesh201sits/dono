@@ -6,6 +6,8 @@ import {
   DonoQueueFullError,
   DonoTimeoutError,
 } from "../errors/dono-errors.js";
+import { EventEmitter } from "../events/event-emitter.js";
+import type { DonoEvents } from "../events/dono-events.js";
 import type { QueuedTask } from "../task/task.js";
 
 export interface SchedulerOptions {
@@ -80,6 +82,7 @@ type EntryState = "pending" | "running" | "delayed" | "settled";
 
 interface QueueEntry {
   readonly task: QueuedTask;
+  readonly taskId: number;
   readonly priority: number;
   sequence: number;
   controller: AbortController;
@@ -95,6 +98,7 @@ interface QueueEntry {
   attempt: number;
   timeoutHandle: ReturnType<typeof setTimeout> | undefined;
   retryHandle: ReturnType<typeof setTimeout> | undefined;
+  attemptStartedAt: number;
 }
 
 type Outcome =
@@ -116,6 +120,7 @@ export class Scheduler {
   });
 
   #running = 0;
+  #nextTaskId = 0;
   #nextSequence = 0;
   #paused = false;
   #closed = false;
@@ -128,8 +133,14 @@ export class Scheduler {
   readonly #emptyWaiters: Array<() => void> = [];
   readonly #idleWaiters: Array<() => void> = [];
   readonly #delayedEntries = new Set<QueueEntry>();
+  readonly #events: EventEmitter<DonoEvents>;
+  #emptyNotified = true;
+  #idleNotified = true;
 
-  constructor(options: SchedulerOptions) {
+  constructor(
+    options: SchedulerOptions,
+    events: EventEmitter<DonoEvents> = new EventEmitter<DonoEvents>(),
+  ) {
     const {
       concurrency,
       intervalCap,
@@ -185,6 +196,7 @@ export class Scheduler {
     this.#intervalCap = intervalCap;
     this.#interval = interval;
     this.#maxQueueSize = maxQueueSize;
+    this.#events = events;
   }
 
   get pending(): number {
@@ -245,14 +257,15 @@ export class Scheduler {
       signal === undefined
         ? undefined
         : () => {
-            const error = new DonoCancelledError();
+          const error = new DonoCancelledError();
 
-            entry.controller.abort(error);
-            this.#cancelEntry(entry, error);
-          };
+          entry.controller.abort(error);
+          this.#cancelEntry(entry, error);
+        };
 
     entry = {
       task,
+      taskId: this.#nextTaskId++,
       priority,
       sequence: this.#nextSequence++,
       controller,
@@ -267,6 +280,7 @@ export class Scheduler {
       attempt: 0,
       timeoutHandle: undefined,
       retryHandle: undefined,
+      attemptStartedAt: 0,
     };
 
     if (signal !== undefined && abortListener !== undefined) {
@@ -276,6 +290,8 @@ export class Scheduler {
     }
 
     this.#queue.push(entry);
+    this.#emptyNotified = false;
+    this.#idleNotified = false;
     this.#drain();
   }
 
@@ -447,6 +463,11 @@ export class Scheduler {
   #run(entry: QueueEntry): void {
     const attempt = ++entry.attempt;
     entry.controller = new AbortController();
+    entry.attemptStartedAt = Date.now();
+    this.#events.emit("active", {
+      taskId: entry.taskId,
+      attempt,
+    });
 
     if (entry.timeout !== undefined) {
       entry.timeoutHandle = setTimeout(() => {
@@ -520,16 +541,28 @@ export class Scheduler {
       return;
     }
 
+    this.#events.emit("error", {
+      taskId: entry.taskId,
+      attempt,
+      error,
+    });
+
     entry.retriesRemaining -= 1;
     this.#running -= 1;
 
     const retryNumber = entry.retries - entry.retriesRemaining;
     const delay = entry.backoff
       ? Math.min(
-          entry.retryDelay * 2 ** (retryNumber - 1),
-          MAX_TIMER_DELAY,
-        )
+        entry.retryDelay * 2 ** (retryNumber - 1),
+        MAX_TIMER_DELAY,
+      )
       : entry.retryDelay;
+    this.#events.emit("retry", {
+      taskId: entry.taskId,
+      attempt,
+      error,
+      delay,
+    });
 
     if (delay === 0) {
       entry.state = "pending";
@@ -601,8 +634,18 @@ export class Scheduler {
     }
 
     if (outcome.ok) {
+      this.#events.emit("completed", {
+        taskId: entry.taskId,
+        attempt: entry.attempt,
+        duration: Date.now() - entry.attemptStartedAt,
+      });
       entry.task.resolve(outcome.value);
     } else {
+      this.#events.emit("error", {
+        taskId: entry.taskId,
+        attempt: entry.attempt,
+        error: outcome.error,
+      });
       entry.task.reject(outcome.error);
     }
 
@@ -614,15 +657,26 @@ export class Scheduler {
   }
 
   #notifyEmpty(): void {
-    if (this.pending !== 0) return;
+    if (this.pending !== 0 || this.#emptyNotified) return;
 
+    this.#emptyNotified = true;
+    this.#events.emit("empty", { pending: this.pending });
     const waiters = this.#emptyWaiters.splice(0);
     for (const resolve of waiters) resolve();
   }
 
   #notifyIdle(): void {
-    if (this.pending !== 0 || this.#running !== 0) return;
+    if (
+      this.pending !== 0 ||
+      this.#running !== 0 ||
+      this.#idleNotified
+    ) return;
 
+    this.#idleNotified = true;
+    this.#events.emit("idle", {
+      pending: this.pending,
+      running: this.#running,
+    });
     const waiters = this.#idleWaiters.splice(0);
     for (const resolve of waiters) resolve();
   }

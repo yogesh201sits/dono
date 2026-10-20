@@ -1,8 +1,10 @@
-
 import {
   Scheduler,
   validateRetryOptions,
 } from "./scheduler/scheduler.js";
+
+import { EventEmitter } from "./events/event-emitter.js";
+import type { DonoEvents } from "./events/dono-events.js";
 
 export interface DonoOptions {
   readonly concurrency?: number;
@@ -29,20 +31,48 @@ export type DonoTask<T> = (
 
 export class Dono {
   readonly #scheduler: Scheduler;
+  readonly #events = new EventEmitter<DonoEvents>();
 
   constructor(options: DonoOptions = {}) {
-    this.#scheduler = new Scheduler({
-      concurrency: options.concurrency ?? Infinity,
-      ...(options.intervalCap !== undefined
-        ? { intervalCap: options.intervalCap }
-        : {}),
-      ...(options.interval !== undefined
-        ? { interval: options.interval }
-        : {}),
-      ...(options.maxQueueSize !== undefined
-        ? { maxQueueSize: options.maxQueueSize }
-        : {}),
-    });
+    this.#scheduler = new Scheduler(
+      {
+        concurrency: options.concurrency ?? Infinity,
+        ...(options.intervalCap !== undefined
+          ? { intervalCap: options.intervalCap }
+          : {}),
+        ...(options.interval !== undefined
+          ? { interval: options.interval }
+          : {}),
+        ...(options.maxQueueSize !== undefined
+          ? { maxQueueSize: options.maxQueueSize }
+          : {}),
+      },
+      this.#events,
+    );
+  }
+
+  on<K extends keyof DonoEvents>(
+    event: K,
+    listener: (payload: DonoEvents[K]) => void,
+  ): this {
+    this.#events.on(event, listener);
+    return this;
+  }
+
+  off<K extends keyof DonoEvents>(
+    event: K,
+    listener: (payload: DonoEvents[K]) => void,
+  ): this {
+    this.#events.off(event, listener);
+    return this;
+  }
+
+  once<K extends keyof DonoEvents>(
+    event: K,
+    listener: (payload: DonoEvents[K]) => void,
+  ): this {
+    this.#events.once(event, listener);
+    return this;
   }
 
   get pending(): number {
